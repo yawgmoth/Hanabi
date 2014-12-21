@@ -2,6 +2,7 @@ module Main (main) where
 
 import System.Random
 import Data.Array.IO
+import Data.Ratio
 import Control.Monad
 import Debug.Trace
 import Data.List
@@ -14,11 +15,12 @@ type Value = Int
 
 type Card = (Color, Value)
 
-data Move a = Discard Int | Play Int | HintColor Int Color | HintValue Int Value | Undecided a
+data Move a = Discard Int | DiscardU Int | Play Int | HintColor Int Color | HintValue Int Value | Undecided a deriving (Show)
 
 instance Monad Move where
     Undecided x >>= f = f x
     Discard n >>= f = Discard n
+    DiscardU n >>= f = DiscardU n
     Play n >>= f = Play n
     HintColor n c >>= f = HintColor n c
     HintValue n v >>= f = HintValue n v
@@ -61,7 +63,49 @@ data GameState = GState {hands :: [[Card]], board :: [Card], trash :: [Card], kn
 data HintType = COLOR | VALUE deriving (Eq, Show)
     
 playsecure :: GameState -> Int -> Move [Int]
-playsecure gs@GState {knowledge=k, hands=h, board=b} pnr = if (length $ possibleplays b (k!!pnr)) > 0 then Play ((possibleplays b (k!!pnr))!!0) else Undecided []
+playsecure gs@GState {knowledge=k, hands=h, board=b} pnr = if (length $ possibleplays b pk) > 0 then Play ((possibleplays b pk)!!0) else Undecided []
+                                                    where
+                                                       pk = publicknowledge (t ++ g ++ (concat h)) (k!!pnr)
+                                                       t = trash gs
+                                                       g = gone b
+
+playcnt :: [Card] -> Map.Map Card Int -> Int
+playcnt board m = sum $ Map.elems (Map.filterWithKey (\k v -> (v > 0) && (isvalidplay board k)) m)
+
+playperc :: [Card] -> Map.Map Card Int -> Ratio Int
+playperc  board m = (playcnt board m) % (sum (Map.elems (Map.filter (> 0) m)))
+
+probableplays' :: Ratio Int -> [Card] -> [Map.Map Card Int] -> Int -> [(Int, Ratio Int)]
+probableplays' limit board knowledge nr | nr == length knowledge = []
+                                  | otherwise = if (perc > limit) then (nr,perc):(probableplays' limit board knowledge (nr+1)) else probableplays' limit board knowledge (nr+1)
+                                           where 
+                                               perc = playperc board (knowledge!!nr)
+
+probableplays :: Ratio Int -> [Card] -> [Map.Map Card Int] -> [(Int, Ratio Int)]
+probableplays limit board knowledge = probableplays' limit board knowledge 0
+
+cmpsnd :: Ord b => (a,b) -> (a,b) -> Ordering
+cmpsnd (_,x) (_,y) = compare x y
+
+playprobable :: Ratio Int -> GameState -> Int -> Move [Int]
+playprobable limit gs@GState {knowledge=k, hands=h, board=b} pnr = if (length $ probableplays limit b pk) > 0 then Play $ fst $ maximumBy (cmpsnd) $ probableplays limit b pk else Undecided []
+                                                         where
+                                                           pk = publicknowledge (t ++ g ++ (concat h)) (k!!pnr)
+                                                           t = trash gs
+                                                           g = gone b
+
+showprobs gs@GState {knowledge=k, hands=h, board=b} pnr = trace ("Board: " ++ (show b) ++ "\nTrash: " ++ (show t) ++ "\nknowledge:\n" ++ pks ++ "\nprobs:" ++ (show probs) ++ "\nplaycnt: " ++ (show plc) ++ "\n\n") Undecided []
+                                                         where
+                                                           pks = concat (map (\(i,k) -> "card " ++ (show i) ++ " " ++ (show k) ++ "\n") $ zip [0..] pk)
+                                                           pk = map (Map.filter (>0)) $ publicknowledge (t ++ g ++ (concat h)) (k!!pnr)
+                                                           t = trash gs
+                                                           g = gone b
+                                                           probs = map (playperc b) pk
+                                                           plc = map (playcnt b) pk
+                                                           
+minfuse :: Int -> GameState -> Move [Int] -> Move [Int]
+minfuse minf gs@GState {fuse=f} m | f >= minf = m
+                                  | otherwise = Undecided []
 
 canplay :: [Card] -> Map.Map Card Int -> Bool
 canplay board m = and (map (isvalidplay board) $ Map.keys (Map.filter (> 0) m))
@@ -139,7 +183,8 @@ entropy :: [Map.Map Card Int] -> Int
 entropy [] = 0
 entropy (m:ms) = entropy' m + entropy ms
 
-entropyhints = 4
+entropyhints = 6
+usefulhints = 2
 
 hintentropy :: GameState -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> Int
 hintentropy gs (h,k,pnr,cnr,typ) | typ == COLOR = entropy (publicknowledge (t ++ (gone b) ++ (concat otherhands)) (makecolorknowledgeplayer h k col))
@@ -168,12 +213,25 @@ cmphintentropy gs hinta@(ha,ka,pnra,cnra,typa) hintb@(hb,kb,pnrb,cnrb,typb) = co
                                            (ysb,zsb) = splitAt pnrb h
 
 makeentropyhint :: GameState -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> Move [Int]
-makeentropyhint gs h@(hand, knowledge, nr, card, COLOR) | (hintentropy gs h) > 0 = HintColor nr col
+makeentropyhint gs h@(hand, knowledge, nr, card, COLOR) | prev - (hintentropy gs h) > 0 = HintColor nr col
                                                         | otherwise = Undecided []
                                            where (col,val) = hand!!card
-makeentropyhint gs h@(hand, knowledge, nr, card, VALUE) | (hintentropy gs h) > 0 = HintValue nr val
+                                                 prev = entropy (publicknowledge (t ++ (gone b) ++ (concat otherhands)) knowledge)
+                                                 t = trash gs
+                                                 hs = hands gs
+                                                 b = board gs
+                                                 otherhands = ys ++ (tail zs)
+                                                 (ys,zs) = splitAt nr hs
+makeentropyhint gs h@(hand, knowledge, nr, card, VALUE) | prev - (hintentropy gs h) > 0 = HintValue nr val
                                                         | otherwise = Undecided []
                                            where (col,val) = hand!!card
+                                                 prev = entropy (publicknowledge (t ++ (gone b) ++ (concat otherhands)) knowledge)
+                                                 t = trash gs
+                                                 hs = hands gs
+                                                 b = board gs
+                                                 otherhands = ys ++ (tail zs)
+                                                 (ys,zs) = splitAt nr hs
+                                           
 
 givehintminentropy :: GameState -> Int -> Move [Int]
 givehintminentropy gs@GState {hands=h, knowledge=k, hints=hnt} pnr | hnt > entropyhints = makeentropyhint gs $ maximumBy (cmphintentropy gs) $ [(h!!nr,k!!nr,nr,card,typ) |  
@@ -182,16 +240,133 @@ givehintminentropy gs@GState {hands=h, knowledge=k, hints=hnt} pnr | hnt > entro
                                                                                                                                 (length (h!!nr)) > 0,
                                                                                                                                 card <- [0..(length (k!!nr))-1], 
                                                                                                                                 typ <- [COLOR, VALUE]]
+                                                                   | otherwise = Undecided []
+                                                     where otherhands = ys ++ (tail zs)
+                                                           (ys,zs) = splitAt pnr h
+
+usefulcard :: [Card] -> Map.Map Card Int -> Int
+usefulcard b m = length [c | c <- (Map.keys $ Map.filter (> 0) m), not $ isvalidplay b c]
+                                                           
+useful :: [Card] -> [Map.Map Card Int] -> Int
+useful _ [] = 0
+useful b (m:ms) = usefulcard b m + (useful b ms)
+                                                           
+hintuse :: GameState -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> Int
+hintuse gs (h,k,pnr,cnr,typ) | typ == COLOR = useful (board gs) (publicknowledge (t ++ (gone b) ++ (concat otherhands)) (makecolorknowledgeplayer h k col))
+                             | otherwise    = useful (board gs) (publicknowledge (t ++ (gone b) ++ (concat otherhands)) (makevalueknowledgeplayer h k val))
+                               where
+                                   t = trash gs
+                                   b = board gs
+                                   otherhands = ys ++ (tail zs)
+                                   (ys,zs) = splitAt pnr allh
+                                   allh = hands gs
+                                   (col,val) = h!!cnr
+                                   
+cmphintuseful :: GameState -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> Ordering
+cmphintuseful gs hinta@(ha,ka,pnra,cnra,typa) hintb@(hb,kb,pnrb,cnrb,typb) = compare (pva - pka) (pvb - pkb)
+                                         where
+                                           pka = hintuse gs hinta
+                                           pkb = hintuse gs hintb
+                                           b = board gs
+                                           t = trash gs
+                                           h = hands gs
+                                           pva = useful (board gs) (publicknowledge (t ++ (gone b) ++ (concat otherhandsa)) ka)
+                                           pvb = useful (board gs) (publicknowledge (t ++ (gone b) ++ (concat otherhandsb)) kb)
+                                           otherhandsa = ysa ++ (tail zsa)
+                                           (ysa,zsa) = splitAt pnra h
+                                           otherhandsb = ysb ++ (tail zsb)
+                                           (ysb,zsb) = splitAt pnrb h
+                                                           
+makeusefulhint :: GameState -> ([Card], [Map.Map Card Int], Int, Int, HintType) -> Move [Int]
+makeusefulhint gs h@(hand, knowledge, nr, card, COLOR) | (hintuse gs h) > 0 = HintColor nr col
+                                                       | otherwise = Undecided []
+                                           where (col,val) = hand!!card
+makeusefulhint gs h@(hand, knowledge, nr, card, VALUE) | (hintuse gs h) > 0 = HintValue nr val
+                                                       | otherwise = Undecided []
+                                           where (col,val) = hand!!card
+                                                           
+givehintuseful :: GameState -> Int -> Move [Int]
+givehintuseful gs@GState {hands=h, knowledge=k, hints=hnt} pnr | hnt > usefulhints = makeusefulhint gs $ maximumBy (cmphintuseful gs) $ [(h!!nr,k!!nr,nr,card,typ) |  
+                                                                                                                                nr <- [0..(length k)-1], 
+                                                                                                                                nr /= pnr,
+                                                                                                                                (length (h!!nr)) > 0,
+                                                                                                                                card <- [0..(length (k!!nr))-1], 
+                                                                                                                                typ <- [COLOR, VALUE]]
                                                          | otherwise = Undecided []
                                                      where otherhands = ys ++ (tail zs)
                                                            (ys,zs) = splitAt pnr h
-    
+
+useless :: Map.Map Card Int -> [Card] -> Bool
+useless m b = and $ map ((flip elem) b) $ Map.keys $ Map.filter (> 0) m
+
+makeuselessdiscard :: [Map.Map Card Int] -> [Card] -> Int -> Move [Int]
+makeuselessdiscard [] _ _ = Undecided []
+makeuselessdiscard (m:ms) b nr | (useless m b) = Discard nr
+                               | otherwise     = makeuselessdiscard ms b (nr+1)
+
+discarduseless :: GameState -> Int -> Move [Int]
+discarduseless gs pnr | (hints gs) < maxhints = makeuselessdiscard k g 0
+                      | otherwise             = Undecided []
+                         where 
+                             k = (knowledge gs)!!pnr
+                             g = gone $ board gs
+
+safecard :: [Card] -> [Card] -> Card -> Bool
+safecard b t c = (c `elem` b || not (c `elem` t)) && (val < 5)
+           where
+               (col,val) = c
+                             
+safe :: Map.Map Card Int -> [Card] -> [Card] -> Bool
+safe m b t = and $ map (safecard b t) $ Map.keys $ Map.filter (> 0) m
+                             
+makesafediscard :: [Map.Map Card Int] -> [Card] -> [Card] -> Int -> Move [Int]
+makesafediscard [] _ _ _                        = Undecided []
+makesafediscard (m:ms) b t nr | (safe m b t)    = Discard nr
+                              | otherwise       = makesafediscard ms b t (nr+1)
+                             
+discardsafe :: GameState -> Int -> Move [Int]
+discardsafe gs pnr | (hints gs) < maxhints = makesafediscard (publicknowledge (g ++ t ++ (concat $ hands gs)) k) g t 0
+                   | otherwise             = Undecided []
+                         where 
+                             k = (knowledge gs)!!pnr
+                             g = gone $ board gs
+                             t = trash gs
+                             
+necessarycount :: GameState -> (Map.Map Card Int,Int) -> Int
+necessarycount gs (k,_) = sum [Map.findWithDefault 0 c k | c <- Map.keys $ Map.filter (> 0) k, not (safecard b t c)]
+                  where
+                     b = gone $ board gs
+                     t = trash gs
+                             
+necessary :: GameState -> (Map.Map Card Int,Int) -> (Map.Map Card Int,Int) -> Ordering
+necessary gs k1 k2 = (necessarycount gs k1) `compare` (necessarycount gs k2)
+             
+                 
+makeunsafediscard :: (Map.Map Card Int,Int) -> Move [Int]
+makeunsafediscard (_,nr) = DiscardU nr
+
+discardunsafe :: GameState -> Int -> Move [Int]
+discardunsafe gs pnr | (hints gs) < maxhints || (fuse gs) < 2 = makeunsafediscard $ minimumBy (necessary gs) $ zip (publicknowledge (g ++ t ++ (concat $ hands gs)) k) [0..]
+                     | otherwise                              = Undecided []
+                         where 
+                             k = (knowledge gs)!!pnr
+                             g = gone $ board gs
+                             t = trash gs
+
+
 play :: GameState -> Int -> Move [Int]
 play gs player = do
              playsecure gs player
+             -- showprobs gs player
+             minfuse 3 gs $ playprobable (6 % 10) gs player
+             minfuse 2 gs $ playprobable (8 % 10) gs player
+             minfuse 1 gs $ playprobable (9 % 10) gs player
              givehint gs player
+             givehintuseful gs player
              givehintminentropy gs player
-             Discard 0
+             discarduseless gs player
+             discardsafe gs player
+             discardunsafe gs player
              Play 0
              
 iscomplete :: [Card] -> Bool
@@ -314,27 +489,48 @@ makehintsplay :: GameState -> Int -> Int -> Int
 makehintsplay gs@GState {board=b, hands=h, hints=hnt} n player = if (isvalidplay b (col,val)) && (val == 5) then (makehintsdiscard gs) else hnt
                                                              where (col,val) = h!!player!!n
 
-makenewgamestate :: GameState -> Move a -> Int -> GameState
-makenewgamestate gs (Discard n) player = trace ("Discard " ++ (show n) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!player!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hands = makediscard gs n player, deck = makedraw gs, extraturns = makeextraturn gs, trash=makediscardtrash gs n player, knowledge=updateknowledge gs n player, hints=makehintsdiscard gs }
-makenewgamestate gs (Play n) player = trace ("Play " ++ (show n) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!player!!n) ++ " board now: " ++ (show (makeplay gs n player)) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hands = makediscard gs n player, deck = makedraw gs, extraturns = makeextraturn gs, board = makeplay gs n player, trash = makeplaytrash gs n player, fuse=makefuse gs n player, knowledge=updateknowledge gs n player, hints=makehintsplay gs n player  }
-makenewgamestate gs (HintColor n c) player = trace ("Hint " ++ (show n) ++ ", " ++ (show c) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hints=makehints gs, knowledge=makecolorknowledge gs n c}
-makenewgamestate gs (HintValue n v) player = trace ("Hint " ++ (show n) ++ ", " ++ (show v) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hints=makehints gs, knowledge=makevalueknowledge gs n v}
-makenewgamestate gs _ _ = gs
+makenewgamestate :: (String -> GameState -> GameState) -> GameState -> Move a -> Int -> GameState
+makenewgamestate t gs (Discard n) player = t ("Discard " ++ (show n) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!player!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hands = makediscard gs n player, deck = makedraw gs, extraturns = makeextraturn gs, trash=makediscardtrash gs n player, knowledge=updateknowledge gs n player, hints=makehintsdiscard gs }
+makenewgamestate t gs (DiscardU n) player = t ("UNSAFE Discard " ++ (show n) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!player!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hands = makediscard gs n player, deck = makedraw gs, extraturns = makeextraturn gs, trash=makediscardtrash gs n player, knowledge=updateknowledge gs n player, hints=makehintsdiscard gs }
+makenewgamestate t gs (Play n) player = t ("Play " ++ (show n) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!player!!n) ++ " board now: " ++ (show (makeplay gs n player)) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hands = makediscard gs n player, deck = makedraw gs, extraturns = makeextraturn gs, board = makeplay gs n player, trash = makeplaytrash gs n player, fuse=makefuse gs n player, knowledge=updateknowledge gs n player, hints=makehintsplay gs n player  }
+makenewgamestate t gs (HintColor n c) player = t ("Hint " ++ (show n) ++ ", " ++ (show c) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hints=makehints gs, knowledge=makecolorknowledge gs n c}
+makenewgamestate t gs (HintValue n v) player = t ("Hint " ++ (show n) ++ ", " ++ (show v) ++ " from player " ++ (show player) ++ ", which is: " ++ (show $ (hands gs)!!n) ++ " " ++ (show $ (length $ (knowledge gs)!!player))) gs { hints=makehints gs, knowledge=makevalueknowledge gs n v}
+makenewgamestate t gs _ _ = gs
 
 score :: GameState -> Int
 score GState {board=b} = sum (map snd b)
 
-turn :: GameState -> Int -> Int
-turn gs@GState {hands=h} player = if (isover gs) then (score gs) else turn nextstate nextplayer
+turn :: (String -> GameState -> GameState) -> GameState -> Int -> Int
+turn t gs@GState {hands=h} player = niltrace ("Board: " ++ (show $ board gs) ++ ", hints: " ++ (show $ hints gs)) (if (isover gs) then (score gs) else turn t nextstate nextplayer)
                  where
                     nextplayer = ((player + 1) `mod` (length h))
-                    nextstate = makenewgamestate gs (play (extractPlayerInformation gs player) player) player
+                    nextstate = makenewgamestate t gs (play (extractPlayerInformation gs player) player) player
                     
 basicknowledge :: Map.Map Card Int
 basicknowledge = Map.fromList $ zip [ (col,c) :: Card | col <- [ RED, YELLOW, GREEN, BLUE, WHITE ], c <- [1..5]] $ cycle quantities
 
-main = do
+niltrace s gs = gs
+
+gsfromhands :: [[Card]] -> GameState
+gsfromhands h = GState { deck = [], hands = h, trash=[], extraturns=0, fuse=3, knowledge=[[basicknowledge | c1 <- [1..5]] | p <- [1..3]], hints=maxhints, board=[ (c,0) | c <- [ RED, YELLOW, GREEN, BLUE, WHITE ] ]}
+
+onegame t = do 
        sdeck <- shuffle thedeck
+       let score = turn t GState {deck=(drop 15 sdeck), hands=[(take 5 sdeck), (take 5 $ drop 5 sdeck), (take 5 $ drop 10 sdeck)], trash=[], extraturns=0, fuse=3, knowledge=[[basicknowledge | c1 <- [1..5]] | p <- [1..3]], hints=maxhints, board=[ (c,0) | c <- [ RED, YELLOW, GREEN, BLUE, WHITE ] ]} 0
+       let s1 = if score > 19 then turn trace GState {deck=(drop 15 sdeck), hands=[(take 5 sdeck), (take 5 $ drop 5 sdeck), (take 5 $ drop 10 sdeck)], trash=[], extraturns=0, fuse=3, knowledge=[[basicknowledge | c1 <- [1..5]] | p <- [1..3]], hints=maxhints, board=[ (c,0) | c <- [ RED, YELLOW, GREEN, BLUE, WHITE ] ]} 0 else 0
+       return score
+       
+ngames 0 t = return 0
+ngames n t = do score <- onegame niltrace
+                score1 <- ngames (n-1) t
+                return (score + score1)
+   
+
+main = do
+        score100 <- ngames 100 niltrace
+        putStrLn $ show $ score100 % 100
+
+{-       sdeck <- shuffle thedeck
        let score = turn GState {deck=(drop 15 sdeck), hands=[(take 5 sdeck), (take 5 $ drop 5 sdeck), (take 5 $ drop 10 sdeck)], trash=[], extraturns=0, fuse=3, knowledge=[[basicknowledge | c1 <- [1..5]] | p <- [1..3]], hints=maxhints, board=[ (c,0) | c <- [ RED, YELLOW, GREEN, BLUE, WHITE ] ]} 0
-       putStrLn $ show score
+       putStrLn $ show score -}
        
